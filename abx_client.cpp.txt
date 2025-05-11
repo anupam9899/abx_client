@@ -1,0 +1,108 @@
+#include <iostream>
+#include <set>
+#include <vector>
+#include <map>
+#include <cstring>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+#define PORT 3000
+#define HOST "127.0.0.1"
+#define PACKET_SIZE 17
+
+struct Packet {
+    std::string symbol;
+    char buySell;
+    int quantity;
+    int price;
+    int sequence;
+};
+
+int readInt32BigEndian(const unsigned char* buffer, int offset) {
+    return (buffer[offset] << 24) | (buffer[offset + 1] << 16) |
+           (buffer[offset + 2] << 8) | buffer[offset + 3];
+}
+
+Packet parsePacket(const unsigned char* data) {
+    Packet p;
+    p.symbol = std::string(reinterpret_cast<const char*>(data), 4);
+    p.buySell = data[4];
+    p.quantity = readInt32BigEndian(data, 5);
+    p.price = readInt32BigEndian(data, 9);
+    p.sequence = readInt32BigEndian(data, 13);
+    return p;
+}
+
+void requestResend(int sequence) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+    inet_pton(AF_INET, HOST, &serverAddr.sin_addr);
+
+    connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+    unsigned char req[2] = {2, (unsigned char)sequence};
+    send(sock, req, 2, 0);
+
+    unsigned char buffer[PACKET_SIZE];
+    int bytes = recv(sock, buffer, PACKET_SIZE, 0);
+    if (bytes == PACKET_SIZE) {
+        Packet p = parsePacket(buffer);
+        std::cout << "Resent Packet: " << p.sequence << " | Symbol: " << p.symbol << " | "
+                  << p.buySell << " | Qty: " << p.quantity << " | Price: " << p.price << "\n";
+    }
+
+    close(sock);
+}
+
+int main() {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+    inet_pton(AF_INET, HOST, &serverAddr.sin_addr);
+
+    connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+    // Send callType = 1
+    unsigned char req[2] = {1, 0};
+    send(sock, req, 2, 0);
+
+    unsigned char buffer[1024];
+    std::map<int, Packet> packets;
+    std::set<int> sequences;
+
+    int totalBytes = 0;
+    while (true) {
+        int bytes = recv(sock, buffer + totalBytes, sizeof(buffer) - totalBytes, 0);
+        if (bytes <= 0) break;
+        totalBytes += bytes;
+
+        while (totalBytes >= PACKET_SIZE) {
+            Packet p = parsePacket(buffer);
+            packets[p.sequence] = p;
+            sequences.insert(p.sequence);
+            std::cout << "Recv Packet: " << p.sequence << " | Symbol: " << p.symbol << " | "
+                      << p.buySell << " | Qty: " << p.quantity << " | Price: " << p.price << "\n";
+
+            // Shift buffer
+            memmove(buffer, buffer + PACKET_SIZE, totalBytes - PACKET_SIZE);
+            totalBytes -= PACKET_SIZE;
+        }
+    }
+
+    close(sock);
+
+    // Check for missing sequences
+    int maxSeq = *sequences.rbegin();
+    for (int i = 1; i < maxSeq; ++i) {
+        if (sequences.find(i) == sequences.end()) {
+            std::cout << "Missing packet: " << i << ", requesting resend...\n";
+            requestResend(i);
+        }
+    }
+
+    return 0;
+}
